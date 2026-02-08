@@ -1,0 +1,1 @@
+sudo apt update && sudo apt install -y build-essential g++ make libomp-dev && mkdir -p ~/code/avoai/{src,bin,models,data} && echo "Установка завершена"
