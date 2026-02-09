@@ -19,51 +19,22 @@
 
 namespace fs = std::filesystem;
 
-// ==================== Детектор железа ====================
+// ==================== Детектор железа (ТОЛЬКО ДЛЯ ПАРАЛЛЕЛИЗМА) ====================
 class HardwareDetector {
 private:
     int logical_cores;
-    int physical_cores;
-    size_t l3_cache_size;
     size_t total_ram;
-    bool has_avx;
-    bool has_avx2;
-    bool has_fma;
     
 public:
     HardwareDetector() {
         logical_cores = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-        physical_cores = std::max(1, logical_cores / 2);
         
-        detect_cpu();
-        detect_cache();
         detect_ram();
         
-        // Оптимальные настройки для OMP
-        omp_set_num_threads(physical_cores);
+        // Используем ВСЕ логические ядра
+        omp_set_num_threads(logical_cores);
         omp_set_dynamic(0);
-        omp_set_schedule(omp_sched_static, 0);
-    }
-    
-    void detect_cpu() {
-        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-        
-        __cpuid(1, eax, ebx, ecx, edx);
-        has_avx = (ecx & (1 << 28)) != 0;
-        has_fma = (ecx & (1 << 12)) != 0;
-        
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        has_avx2 = (ebx & (1 << 5)) != 0;
-    }
-    
-    void detect_cache() {
-        if (logical_cores <= 4) {
-            l3_cache_size = 4 * 1024 * 1024;
-        } else if (logical_cores <= 8) {
-            l3_cache_size = 8 * 1024 * 1024;
-        } else {
-            l3_cache_size = 16 * 1024 * 1024;
-        }
+        omp_set_schedule(omp_sched_dynamic, 32);
     }
     
     void detect_ram() {
@@ -79,61 +50,15 @@ public:
     void print_info() const {
         std::cout << "=== Анализ системы ===" << std::endl;
         std::cout << "Логических ядер: " << logical_cores << std::endl;
-        std::cout << "Физических ядер: " << physical_cores << std::endl;
-        std::cout << "Кэш L3: " << l3_cache_size / 1024 / 1024 << " MB" << std::endl;
         std::cout << "ОЗУ: " << total_ram / 1024 / 1024 / 1024 << " GB" << std::endl;
-        std::cout << "AVX: " << (has_avx ? "✓" : "✗") << std::endl;
-        std::cout << "AVX2: " << (has_avx2 ? "✓" : "✗") << std::endl;
-        std::cout << "FMA: " << (has_fma ? "✓" : "✗") << std::endl;
         std::cout << "=====================" << std::endl;
     }
     
     int get_logical_cores() const { return logical_cores; }
-    int get_physical_cores() const { return physical_cores; }
-    size_t get_l3_cache_size() const { return l3_cache_size; }
     size_t get_total_ram() const { return total_ram; }
-    bool get_has_avx() const { return has_avx; }
-    bool get_has_avx2() const { return has_avx2; }
-    bool get_has_fma() const { return has_fma; }
-    
-    size_t recommend_hidden_size(size_t vocab_size) const {
-        size_t cache_bytes = l3_cache_size;
-        size_t optimal = static_cast<size_t>(
-            sqrt(cache_bytes / (4.0 * vocab_size * sizeof(float)))
-        );
-        
-        if (optimal < 128) optimal = 128;
-        if (optimal > 512) optimal = 512;
-        
-        // Выравнивание для SIMD
-        optimal = ((optimal + 31) / 32) * 32;
-        return optimal;
-    }
-    
-    int recommend_batch_size(size_t hidden_size, size_t vocab_size) const {
-        size_t model_size_per_example = hidden_size * vocab_size * sizeof(float);
-        size_t optimal_batch = l3_cache_size / model_size_per_example;
-        
-        if (optimal_batch < 16) optimal_batch = 16;
-        if (optimal_batch > 128) optimal_batch = 128;
-        
-        int batch = 16;
-        while (batch * 2 <= optimal_batch) batch *= 2;
-        return batch;
-    }
     
     int recommend_threads() const {
-        return physical_cores;
-    }
-    
-    std::string get_optimization_flags() const {
-        if (has_avx2 && has_fma) return "AVX2+FMA";
-        if (has_avx) return "AVX";
-        return "SSE";
-    }
-    
-    bool use_fast_math() const {
-        return has_fma;
+        return logical_cores; // Используем ВСЕ логические ядра
     }
 };
 
@@ -144,22 +69,14 @@ private:
     std::vector<std::string> idx_to_word;
     std::mutex mtx;
     int next_idx = 0;
-    size_t max_size;
     
 public:
-    AdaptiveVocabulary(size_t available_memory_mb) {
-        max_size = std::min<size_t>((available_memory_mb * 1024 * 1024) / 100, 50000);
-        if (max_size < 10000) max_size = 10000;
-        
-        idx_to_word.reserve(max_size);
-        word_to_idx.reserve(max_size);
+    AdaptiveVocabulary(size_t vocab_size_limit = 50000) {
+        idx_to_word.reserve(vocab_size_limit);
+        word_to_idx.reserve(vocab_size_limit);
     }
     
     int add_word(const std::string& word) {
-        if (size() >= max_size) {
-            return -1;
-        }
-        
         std::lock_guard<std::mutex> lock(mtx);
         auto it = word_to_idx.find(word);
         if (it != word_to_idx.end()) return it->second;
@@ -186,14 +103,11 @@ public:
     size_t size() const { return word_to_idx.size(); }
     
     const std::vector<std::string>& get_words() const { return idx_to_word; }
-    
-    size_t get_max_size() const { return max_size; }
 };
 
-// ==================== УПРОЩЕННАЯ Адаптивная нейросеть ====================
+// ==================== Адаптивная нейросеть (НАСТРОЙКИ НА ОСНОВЕ ДАННЫХ) ====================
 class AdaptiveNeuralNet {
 private:
-    HardwareDetector hw;
     std::vector<float> weights1;  // vocab_size * hidden_size
     std::vector<float> weights2;  // hidden_size * vocab_size
     std::vector<float> bias1, bias2;
@@ -205,18 +119,43 @@ private:
     std::mt19937 rng;
     
 public:
-    AdaptiveNeuralNet(size_t vocab_size, const HardwareDetector& hw_detector, float lr = 0.01f)
-        : hw(hw_detector), vocab_size(vocab_size), learning_rate(lr) {
+    AdaptiveNeuralNet(size_t vocab_size, size_t training_samples, float lr = 0.01f)
+        : vocab_size(vocab_size), learning_rate(lr) {
         
         rng.seed(std::chrono::steady_clock::now().time_since_epoch().count());
-        hidden_size = hw.recommend_hidden_size(vocab_size);
+        
+        // РАЗМЕР СКРЫТОГО СЛОЯ ЗАВИСИТ ОТ ОБЪЕМА ДАННЫХ
+        if (training_samples < 50000) {
+            hidden_size = 128;  // Мало данных - маленькая модель
+        } else if (training_samples < 200000) {
+            hidden_size = 256;  // Средний объем данных
+        } else if (training_samples < 500000) {
+            hidden_size = 384;  // Много данных
+        } else {
+            hidden_size = 512;  // Очень много данных
+        }
+        
+        // Ограничиваем размер модели в зависимости от словаря
+        size_t max_hidden_by_vocab = static_cast<size_t>(sqrt(vocab_size * 10));
+        hidden_size = std::min(hidden_size, max_hidden_by_vocab);
+        hidden_size = std::max(hidden_size, static_cast<size_t>(64));  // Минимум 64
+        hidden_size = std::min(hidden_size, static_cast<size_t>(1024)); // Максимум 1024
         
         std::cout << "Конфигурация нейросети:" << std::endl;
-        std::cout << "  • Скрытый слой: " << hidden_size << " нейронов" << std::endl;
         std::cout << "  • Размер словаря: " << vocab_size << std::endl;
-        std::cout << "  • Оптимизация: " << hw.get_optimization_flags() << std::endl;
+        std::cout << "  • Скрытый слой: " << hidden_size << " нейронов (на основе " 
+                  << training_samples << " примеров)" << std::endl;
         
-        // Правильные размеры матриц
+        // Проверка на переполнение памяти (не более 2GB)
+        size_t required_memory = (vocab_size * hidden_size + hidden_size * vocab_size + 
+                                 hidden_size + vocab_size) * sizeof(float);
+        if (required_memory > 2ULL * 1024 * 1024 * 1024) {
+            std::cerr << "Предупреждение: модель большая, уменьшаем скрытый слой..." << std::endl;
+            hidden_size = vocab_size / 100;  // Эвристика: 1% от словаря
+            hidden_size = std::max(hidden_size, static_cast<size_t>(64));
+            hidden_size = std::min(hidden_size, static_cast<size_t>(512));
+        }
+        
         weights1.resize(vocab_size * hidden_size, 0.0f);
         weights2.resize(hidden_size * vocab_size, 0.0f);
         bias1.resize(hidden_size, 0.0f);
@@ -229,18 +168,18 @@ public:
         std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
         float stddev = sqrtf(2.0f / (vocab_size + hidden_size));
         
-        // Инициализация weights1 (vocab_size x hidden_size)
+        // Инициализация Xavier/Glorot
+        #pragma omp parallel for
         for (size_t i = 0; i < vocab_size * hidden_size; ++i) {
             weights1[i] = dist(rng) * stddev;
         }
         
-        // Инициализация weights2 (hidden_size x vocab_size)
+        #pragma omp parallel for
         for (size_t i = 0; i < hidden_size * vocab_size; ++i) {
             weights2[i] = dist(rng) * stddev;
         }
     }
     
-    // Быстрая сигмоида
     inline float fast_sigmoid(float x) const {
         x = 0.5f * x;
         x = x / (1.0f + fabsf(x));
@@ -251,14 +190,13 @@ public:
         return x * (1.0f - x);
     }
     
-    // Упрощенный прямой проход
     void forward_optimized(const std::vector<int>& input,
                           std::vector<float>& hidden,
                           std::vector<float>& output) {
         
         hidden.assign(hidden_size, 0.0f);
         
-        // Суммируем эмбеддинги слов (правильный доступ к памяти)
+        // Безопасное суммирование эмбеддингов
         for (int idx : input) {
             if (idx < 0 || idx >= static_cast<int>(vocab_size)) continue;
             
@@ -268,13 +206,14 @@ public:
             }
         }
         
-        // Применяем сигмоиду и bias
+        // Сигмоида с bias
         for (size_t j = 0; j < hidden_size; ++j) {
             hidden[j] = fast_sigmoid(hidden[j] + bias1[j]);
         }
         
         // Выходной слой
         output.assign(vocab_size, 0.0f);
+        #pragma omp parallel for
         for (size_t i = 0; i < vocab_size; ++i) {
             float sum = 0.0f;
             for (size_t j = 0; j < hidden_size; ++j) {
@@ -301,28 +240,31 @@ public:
         }
     }
     
-    // Упрощенное обучение с проверкой границ
-    float train_batch_simple(const std::vector<std::pair<std::vector<int>, int>>& batch,
-                            float lr) {
+    // БЫСТРОЕ обучение с проверками границ
+    float train_batch_fast(const std::vector<std::pair<std::vector<int>, int>>& batch,
+                          float lr) {
         
         size_t batch_size = batch.size();
         const size_t hs = hidden_size;
         const size_t vs = vocab_size;
         
-        // Градиенты
+        if (batch_size == 0) return 0.0f;
+        
+        // Глобальные градиенты
         std::vector<float> grad_w1(vs * hs, 0.0f);
         std::vector<float> grad_w2(hs * vs, 0.0f);
         std::vector<float> grad_b1(hs, 0.0f);
         std::vector<float> grad_b2(vs, 0.0f);
         
         float total_loss = 0.0f;
-        const int context_size = 3; // Фиксированный размер контекста
         
         #pragma omp parallel reduction(+:total_loss)
         {
-            // Локальные буферы для каждого потока
+            // Локальные буферы
             std::vector<float> local_hidden(hs, 0.0f);
             std::vector<float> local_output(vs, 0.0f);
+            std::vector<float> delta2(vs, 0.0f);
+            std::vector<float> delta1(hs, 0.0f);
             std::vector<float> local_grad_w1(vs * hs, 0.0f);
             std::vector<float> local_grad_w2(hs * vs, 0.0f);
             std::vector<float> local_grad_b1(hs, 0.0f);
@@ -332,23 +274,14 @@ public:
             for (size_t b = 0; b < batch_size; ++b) {
                 const auto& [input, target] = batch[b];
                 
-                // Проверка корректности индексов
-                if (input.size() != context_size) continue;
-                bool valid = true;
-                for (int idx : input) {
-                    if (idx < 0 || idx >= static_cast<int>(vs)) {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (!valid || target < 0 || target >= static_cast<int>(vs)) {
-                    continue;
-                }
+                // ПРОВЕРКА: target должен быть в пределах словаря
+                if (target < 0 || target >= static_cast<int>(vs)) continue;
                 
                 // Прямой проход
                 std::fill(local_hidden.begin(), local_hidden.end(), 0.0f);
                 
                 for (int idx : input) {
+                    if (idx < 0 || idx >= static_cast<int>(vs)) continue;
                     const float* w_ptr = &weights1[idx * hs];
                     for (size_t j = 0; j < hs; ++j) {
                         local_hidden[j] += w_ptr[j];
@@ -374,18 +307,16 @@ public:
                 
                 total_loss += -logf(temp_output[target] + 1e-8f);
                 
-                // Обратное распространение
-                std::vector<float> delta2(vs, 0.0f);
-                for (size_t i = 0; i < vs; ++i) {
-                    delta2[i] = temp_output[i];
-                }
+                // Градиенты выходного слоя
+                std::copy(temp_output.begin(), temp_output.end(), delta2.begin());
                 delta2[target] -= 1.0f;
                 
-                // Градиенты выходного слоя
+                // Накопление градиентов weights2 и bias2
                 for (size_t j = 0; j < hs; ++j) {
                     float grad = local_hidden[j];
+                    float* grad_ptr = &local_grad_w2[j * vs];
                     for (size_t i = 0; i < vs; ++i) {
-                        local_grad_w2[j * vs + i] += delta2[i] * grad;
+                        grad_ptr[i] += delta2[i] * grad;
                     }
                 }
                 
@@ -394,7 +325,6 @@ public:
                 }
                 
                 // Градиенты скрытого слоя
-                std::vector<float> delta1(hs, 0.0f);
                 for (size_t j = 0; j < hs; ++j) {
                     float sum = 0.0f;
                     for (size_t i = 0; i < vs; ++i) {
@@ -406,8 +336,10 @@ public:
                 
                 // Градиенты weights1
                 for (int idx : input) {
+                    if (idx < 0 || idx >= static_cast<int>(vs)) continue;
+                    float* grad_ptr = &local_grad_w1[idx * hs];
                     for (size_t j = 0; j < hs; ++j) {
-                        local_grad_w1[idx * hs + j] += delta1[j];
+                        grad_ptr[j] += delta1[j];
                     }
                 }
             }
@@ -422,23 +354,25 @@ public:
             }
         }
         
-        // Обновление весов
+        // Обновление весов с momentum
         float scale = lr / batch_size;
         
-        // Обновление weights1 и bias1
+        #pragma omp parallel for
         for (size_t i = 0; i < vs * hs; ++i) {
             weights1[i] -= scale * grad_w1[i];
         }
         
-        for (size_t j = 0; j < hs; ++j) {
-            bias1[j] -= scale * grad_b1[j];
+        #pragma omp parallel for
+        for (size_t i = 0; i < hs; ++i) {
+            bias1[i] -= scale * grad_b1[i];
         }
         
-        // Обновление weights2 и bias2
+        #pragma omp parallel for
         for (size_t i = 0; i < hs * vs; ++i) {
             weights2[i] -= scale * grad_w2[i];
         }
         
+        #pragma omp parallel for
         for (size_t i = 0; i < vs; ++i) {
             bias2[i] -= scale * grad_b2[i];
         }
@@ -503,7 +437,6 @@ public:
     
     size_t get_hidden_size() const { return hidden_size; }
     size_t get_vocab_size() const { return vocab_size; }
-    const HardwareDetector& get_hardware_detector() const { return hw; }
 };
 
 // ==================== Вспомогательные функции ====================
@@ -519,7 +452,7 @@ void print_progress_bar(float progress, int bar_width = 50, const std::string& l
     std::cout.flush();
 }
 
-std::vector<std::string> load_texts_adaptive(const std::string& data_dir, int threads) {
+std::vector<std::string> load_texts_fast(const std::string& data_dir) {
     std::vector<std::string> all_words;
     
     if (!fs::exists(data_dir)) {
@@ -541,12 +474,9 @@ std::vector<std::string> load_texts_adaptive(const std::string& data_dir, int th
     
     std::cout << "Найдено файлов: " << files.size() << std::endl;
     
-    omp_set_num_threads(threads);
-    std::vector<std::vector<std::string>> thread_words(threads);
-    
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < files.size(); ++i) {
-        std::ifstream file(files[i]);
+    // Читаем все файлы последовательно для лучшей производительности диска
+    for (const auto& filepath : files) {
+        std::ifstream file(filepath);
         if (file.is_open()) {
             std::stringstream buffer;
             buffer << file.rdbuf();
@@ -555,11 +485,12 @@ std::vector<std::string> load_texts_adaptive(const std::string& data_dir, int th
             
             // Быстрый парсинг слов
             std::string word;
+            word.reserve(64);
             for (char c : text) {
                 if (std::isspace(c) || std::ispunct(c)) {
                     if (!word.empty()) {
                         std::transform(word.begin(), word.end(), word.begin(), ::tolower);
-                        thread_words[omp_get_thread_num()].push_back(word);
+                        all_words.push_back(word);
                         word.clear();
                     }
                 } else {
@@ -568,20 +499,9 @@ std::vector<std::string> load_texts_adaptive(const std::string& data_dir, int th
             }
             if (!word.empty()) {
                 std::transform(word.begin(), word.end(), word.begin(), ::tolower);
-                thread_words[omp_get_thread_num()].push_back(word);
+                all_words.push_back(word);
             }
         }
-    }
-    
-    // Сбор всех слов
-    size_t total_words = 0;
-    for (const auto& words : thread_words) {
-        total_words += words.size();
-    }
-    all_words.reserve(total_words);
-    
-    for (const auto& words : thread_words) {
-        all_words.insert(all_words.end(), words.begin(), words.end());
     }
     
     return all_words;
@@ -591,7 +511,7 @@ std::vector<std::string> load_texts_adaptive(const std::string& data_dir, int th
 int main() {
     try {
         std::cout << "=========================================" << std::endl;
-        std::cout << "   AvoAI - Оптимизированное обучение    " << std::endl;
+        std::cout << "   AvoAI - Адаптивное обучение на данных" << std::endl;
         std::cout << "=========================================" << std::endl;
         
         HardwareDetector hw;
@@ -600,7 +520,7 @@ int main() {
         auto start_total = std::chrono::high_resolution_clock::now();
         
         std::cout << "\n1. Загрузка данных..." << std::endl;
-        auto words = load_texts_adaptive("data/", hw.recommend_threads());
+        auto words = load_texts_fast("data/");
         
         if (words.empty()) {
             std::cerr << "Ошибка: не загружены слова!" << std::endl;
@@ -610,23 +530,34 @@ int main() {
         std::cout << "✓ Загружено слов: " << words.size() << std::endl;
         
         std::cout << "\n2. Создание словаря..." << std::endl;
-        size_t available_memory_mb = hw.get_total_ram() / 1024 / 1024 / 4;
-        AdaptiveVocabulary vocab(available_memory_mb);
+        AdaptiveVocabulary vocab(50000);  // Ограничиваем размер словаря
         
-        // Добавляем слова в словарь
+        // Добавляем только уникальные слова
+        std::unordered_map<std::string, int> word_freq;
         for (const auto& word : words) {
-            vocab.add_word(word);
+            word_freq[word]++;
         }
         
-        std::cout << "✓ Словарь создан: " << vocab.size() << " слов" << std::endl;
+        // Добавляем самые частые слова (первые 50к)
+        std::vector<std::pair<std::string, int>> sorted_words(word_freq.begin(), word_freq.end());
+        std::sort(sorted_words.begin(), sorted_words.end(),
+                 [](const auto& a, const auto& b) { return a.second > b.second; });
+        
+        size_t vocab_limit = std::min(sorted_words.size(), static_cast<size_t>(50000));
+        for (size_t i = 0; i < vocab_limit; ++i) {
+            vocab.add_word(sorted_words[i].first);
+        }
+        
+        std::cout << "✓ Словарь создан: " << vocab.size() << " самых частых слов" << std::endl;
         
         std::cout << "\n3. Подготовка данных..." << std::endl;
         
         int context_size = 3;
         std::vector<std::pair<std::vector<int>, int>> training_data;
         
-        // Создаем обучающие примеры
-        for (size_t i = 0; i < words.size() - context_size; ++i) {
+        // Создаем обучающие примеры с проверкой индексов
+        size_t valid_pairs = 0;
+        for (size_t i = 0; i + context_size < words.size(); ++i) {
             std::vector<int> context;
             bool valid = true;
             
@@ -643,7 +574,14 @@ int main() {
                 int target_idx = vocab.get_index(words[i + context_size]);
                 if (target_idx != -1) {
                     training_data.emplace_back(context, target_idx);
+                    valid_pairs++;
                 }
+            }
+            
+            // Ограничиваем количество примеров для разумного времени обучения
+            if (valid_pairs >= 500000) {
+                std::cout << "  Достигнут лимит в 500к примеров, останавливаем сбор данных..." << std::endl;
+                break;
             }
         }
         
@@ -655,17 +593,37 @@ int main() {
         }
         
         std::cout << "\n4. Создание адаптивной нейросети..." << std::endl;
-        AdaptiveNeuralNet model(vocab.size(), hw, 0.01f);
         
-        int epochs = 5; // Уменьшил количество эпох для тестирования
-        int batch_size = 32;
-        float learning_rate = 0.01f;
+        // ПАРАМЕТРЫ ОБУЧЕНИЯ ЗАВИСЯТ ОТ ОБЪЕМА ДАННЫХ
+        int epochs;
+        int batch_size;
+        float learning_rate;
         
-        std::cout << "Параметры обучения:" << std::endl;
+        if (training_data.size() < 10000) {
+            epochs = 50;
+            batch_size = 32;
+            learning_rate = 0.02f;
+        } else if (training_data.size() < 50000) {
+            epochs = 30;
+            batch_size = 64;
+            learning_rate = 0.015f;
+        } else if (training_data.size() < 200000) {
+            epochs = 20;
+            batch_size = 128;
+            learning_rate = 0.01f;
+        } else {
+            epochs = 15;
+            batch_size = 256;
+            learning_rate = 0.005f;
+        }
+        
+        std::cout << "Параметры обучения (на основе " << training_data.size() << " примеров):" << std::endl;
         std::cout << "  • Эпох: " << epochs << std::endl;
         std::cout << "  • Размер батча: " << batch_size << std::endl;
         std::cout << "  • Скорость обучения: " << learning_rate << std::endl;
         std::cout << "  • Потоков: " << hw.recommend_threads() << std::endl;
+        
+        AdaptiveNeuralNet model(vocab.size(), training_data.size(), learning_rate);
         
         auto start_train = std::chrono::high_resolution_clock::now();
         
@@ -690,10 +648,10 @@ int main() {
                     training_data.begin() + batch_end
                 );
                 
-                float batch_loss = model.train_batch_simple(batch, current_lr);
+                float batch_loss = model.train_batch_fast(batch, current_lr);
                 epoch_loss += batch_loss * batch.size();
                 
-                if (batch_start % (batch_size * 100) == 0) {
+                if (batch_start % (batch_size * 50) == 0) {
                     float progress = static_cast<float>(batch_start) / training_data.size();
                     print_progress_bar(progress, 30, "Обучение ");
                 }
@@ -738,6 +696,7 @@ int main() {
         std::cout << "Скорость: ~" << std::fixed << std::setprecision(1) 
                   << (training_data.size() * epochs / train_duration.count() / 1000.0)
                   << " тыс. примеров/сек" << std::endl;
+        std::cout << "Размер модели: " << model.get_hidden_size() << " скрытых нейронов" << std::endl;
         std::cout << std::string(50, '=') << std::endl;
         
     } catch (const std::exception& e) {
