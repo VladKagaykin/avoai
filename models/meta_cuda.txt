@@ -1,0 +1,3 @@
+vocab_size 41190
+hidden_size 256
+context_size 3
