@@ -9,116 +9,10 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <memory>
 
-// ==================== ВЕРСИЯ С LIBTORCH (для CUDA моделей) ====================
-#ifdef USE_LIBTORCH
-#include <torch/torch.h>
-#include <torch/script.h>
+namespace fs = std::filesystem;
 
-// Структура модели, идентичная той, что использовалась в train_cuda.cpp
-struct NeuralNetImpl : torch::nn::Module {
-    torch::nn::Linear fc1{nullptr}, fc2{nullptr};
-
-    NeuralNetImpl(int64_t vocab_size, int64_t hidden_size)
-        : fc1(register_module("fc1", torch::nn::Linear(vocab_size, hidden_size))),
-          fc2(register_module("fc2", torch::nn::Linear(hidden_size, vocab_size))) {}
-
-    torch::Tensor forward(torch::Tensor x) {
-        x = torch::relu(fc1(x));
-        x = fc2(x);
-        return x;
-    }
-};
-TORCH_MODULE(NeuralNet);
-
-class PyTorchModel {
-private:
-    NeuralNet module = nullptr;
-    torch::Device device = torch::Device(torch::kCPU); // Всегда CPU для чата
-    int64_t vocab_size = 0;
-    int64_t hidden_size = 0;
-    
-public:
-    PyTorchModel(const std::string& model_path) {
-        std::cout << "  Используем CPU для инференса (рекомендовано для чата)" << std::endl;
-        
-        try {
-            // 1. Читаем метаданные
-            std::string meta_path = "models/meta_cuda.txt";
-            std::ifstream meta_file(meta_path);
-            if (meta_file.is_open()) {
-                std::string line;
-                while (std::getline(meta_file, line)) {
-                    std::istringstream iss(line);
-                    std::string key;
-                    int64_t value;
-                    if (iss >> key >> value) {
-                        if (key == "vocab_size") vocab_size = value;
-                        if (key == "hidden_size") hidden_size = value;
-                    }
-                }
-                meta_file.close();
-            }
-            
-            if (vocab_size == 0 || hidden_size == 0) {
-                throw std::runtime_error("Не удалось прочитать размеры модели из " + meta_path);
-            }
-            
-            std::cout << "  Размеры модели: vocab=" << vocab_size 
-                      << ", hidden=" << hidden_size << std::endl;
-            
-            // 2. Создаём модель с правильными размерами
-            module = NeuralNet(vocab_size, hidden_size);
-            
-            // 3. Загружаем веса
-            torch::load(module, model_path);
-            
-            module->eval();
-            std::cout << "  Модель PyTorch загружена успешно" << std::endl;
-            
-        } catch (const c10::Error& e) {
-            throw std::runtime_error("Ошибка загрузки модели PyTorch: " + 
-                                    std::string(e.what()));
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("Ошибка: ") + e.what());
-        }
-    } // ← ЗАКРЫВАЮЩАЯ СКОБКА КОНСТРУКТОРА
-    
-    int predict_next(const std::vector<int>& context) {
-        if (context.empty() || !module) return -1;
-        
-        try {
-            // Создаем тензор на CPU
-            auto options = torch::TensorOptions().dtype(torch::kInt64);
-            torch::Tensor cpu_tensor = torch::from_blob(
-                const_cast<int*>(context.data()), 
-                {1, static_cast<int64_t>(context.size())}, 
-                options
-            ).clone();
-            
-            // Преобразуем в one-hot
-            auto one_hot = torch::nn::functional::one_hot(cpu_tensor, vocab_size)
-                           .to(torch::kFloat32);
-            
-            // Усредняем по контексту
-            auto input = one_hot.mean(/*dim=*/1);
-            
-            // Прямой проход
-            torch::NoGradGuard no_grad;
-            auto output = module->forward(input);
-            
-            return torch::argmax(output, 1).item<int>();
-            
-        } catch (const c10::Error& e) {
-            std::cerr << "  Ошибка при инференсе: " << e.what() << std::endl;
-            return -1;
-        }
-    }
-};
-#endif
-
-// ==================== ОРИГИНАЛЬНЫЙ КЛАСС НЕЙРОСЕТИ (без CUDA) ====================
+// ==================== ОРИГИНАЛЬНАЯ CPU МОДЕЛЬ ====================
 class NeuralNetCPU {
 private:
     std::vector<std::vector<float>> weights1;
@@ -132,10 +26,6 @@ private:
 public:
     NeuralNetCPU(size_t vocab_size = 0, size_t hidden_size = 128, float lr = 0.01f)
         : vocab_size(vocab_size), hidden_size(hidden_size), learning_rate(lr) {}
-    
-    inline float sigmoid(float x) {
-        return 1.0f / (1.0f + expf(-x));
-    }
     
     std::vector<float> softmax(const std::vector<float>& logits) {
         std::vector<float> exp_values(logits.size());
@@ -160,18 +50,26 @@ public:
         
         hidden.assign(hidden_size, 0.0f);
         
+        // Суммируем эмбеддинги слов контекста
         for (size_t i = 0; i < input.size(); ++i) {
             int idx = input[i];
-            if (idx < 0 || idx >= (int)vocab_size) continue;
+            if (idx < 0 || static_cast<size_t>(idx) >= vocab_size) continue;
             for (size_t j = 0; j < hidden_size; ++j) {
                 hidden[j] += weights1[j][idx];
             }
         }
         
-        for (size_t i = 0; i < hidden_size; ++i) {
-            hidden[i] = sigmoid(hidden[i] + bias1[i]);
+        // Усредняем и применяем ReLU (как в train_cuda)
+        if (!input.empty()) {
+            float scale = 1.0f / input.size();
+            for (size_t i = 0; i < hidden_size; ++i) {
+                hidden[i] = hidden[i] * scale + bias1[i];
+                // ReLU активация
+                if (hidden[i] < 0) hidden[i] = 0.0f;
+            }
         }
         
+        // Выходной слой
         std::vector<float> logits(vocab_size, 0.0f);
         
         for (size_t i = 0; i < vocab_size; ++i) {
@@ -192,8 +90,17 @@ public:
         forward(context, hidden, output);
         
         if (output.empty()) return -1;
-        return std::distance(output.begin(), 
-                           std::max_element(output.begin(), output.end()));
+        
+        // Выбираем слово с максимальной вероятностью
+        int best_idx = 0;
+        float best_prob = output[0];
+        for (size_t i = 1; i < output.size(); ++i) {
+            if (output[i] > best_prob) {
+                best_prob = output[i];
+                best_idx = i;
+            }
+        }
+        return best_idx;
     }
     
     void load(const std::string& filename) {
@@ -230,60 +137,34 @@ public:
                  bias2.size() * sizeof(float));
         
         file.close();
+        
+        // Проверяем загруженные веса
+        std::cout << "  Загружено параметров: " 
+                  << weights1.size() * weights1[0].size() + 
+                     weights2.size() * weights2[0].size() +
+                     bias1.size() + bias2.size() << std::endl;
     }
     
     size_t get_vocab_size() const { return vocab_size; }
-    size_t get_hidden_size() const { return hidden_size; }
 };
 
-// ==================== ОБНОВЛЁННЫЙ КЛАСС ЧАТА ====================
+// ==================== КЛАСС ЧАТА ====================
 class ChatModel {
 private:
-    NeuralNetCPU original_model;
-    #ifdef USE_LIBTORCH
-    std::unique_ptr<PyTorchModel> pytorch_model;
-    #endif
-    
+    NeuralNetCPU model;
     std::vector<std::string> vocabulary;
     std::unordered_map<std::string, int> word_to_idx;
-    
-    bool use_pytorch_model = false;
-    std::string model_type = "original";
     
 public:
     ChatModel(const std::string& model_path, const std::string& vocab_path) {
         // Загружаем словарь
         load_vocabulary(vocab_path);
         
-        // Определяем тип модели по расширению файла
-        std::filesystem::path model_file(model_path);
-        std::string extension = model_file.extension().string();
+        // Загружаем модель
+        model = NeuralNetCPU(vocabulary.size(), 256);
+        model.load(model_path);
         
-        if (extension == ".pt" || extension == ".pth") {
-            #ifdef USE_LIBTORCH
-            std::cout << "  Обнаружена модель PyTorch (.pt)" << std::endl;
-            pytorch_model = std::make_unique<PyTorchModel>(model_path);
-            use_pytorch_model = true;
-            model_type = "pytorch";
-            #else
-            throw std::runtime_error(
-                "Обнаружена модель PyTorch, но компиляция без поддержки LibTorch.\n"
-                "Перекомпилируйте с флагом: g++ -DUSE_LIBTORCH ..."
-            );
-            #endif
-        } else if (extension == ".bin") {
-            std::cout << "  Обнаружена оригинальная модель (.bin)" << std::endl;
-            original_model = NeuralNetCPU(vocabulary.size(), 256);
-            original_model.load(model_path);
-            use_pytorch_model = false;
-            model_type = "original";
-        } else {
-            throw std::runtime_error(
-                "Неизвестный формат модели. Поддерживаются:\n"
-                "  - .bin (оригинальная бинарная модель)\n"
-                "  - .pt/.pth (модель PyTorch)"
-            );
-        }
+        std::cout << "  Размер словаря модели: " << model.get_vocab_size() << std::endl;
     }
     
     void load_vocabulary(const std::string& path) {
@@ -295,19 +176,17 @@ public:
         std::string line;
         int idx = 0;
         
+        // Простой формат: по одному слову на строку
         while (std::getline(file, line)) {
             if (!line.empty()) {
-                // Поддерживаем оба формата: просто слово или "слово\tиндекс"
-                std::string word;
-                size_t tab_pos = line.find('\t');
-                if (tab_pos != std::string::npos) {
-                    word = line.substr(0, tab_pos);
-                } else {
-                    word = line;
-                }
+                // Убираем пробелы
+                line.erase(0, line.find_first_not_of(" \t\n\r"));
+                line.erase(line.find_last_not_of(" \t\n\r") + 1);
                 
-                vocabulary.push_back(word);
-                word_to_idx[word] = idx++;
+                if (!line.empty()) {
+                    vocabulary.push_back(line);
+                    word_to_idx[line] = idx++;
+                }
             }
         }
         
@@ -318,6 +197,13 @@ public:
         }
         
         std::cout << "  Загружено слов в словаре: " << vocabulary.size() << std::endl;
+        
+        // Выводим примеры слов для проверки
+        std::cout << "  Примеры слов: ";
+        for (int i = 0; i < std::min(10, static_cast<int>(vocabulary.size())); ++i) {
+            std::cout << vocabulary[i] << " ";
+        }
+        std::cout << std::endl;
     }
     
     std::vector<int> text_to_indices(const std::string& text) {
@@ -326,11 +212,28 @@ public:
         std::string word;
         
         while (ss >> word) {
+            // Приводим к нижнему регистру
             std::transform(word.begin(), word.end(), word.begin(), ::tolower);
             
             auto it = word_to_idx.find(word);
             if (it != word_to_idx.end()) {
                 indices.push_back(it->second);
+            } else {
+                // Ищем слово без пунктуации
+                std::string clean_word;
+                for (char c : word) {
+                    if (!std::ispunct(c)) {
+                        clean_word += c;
+                    }
+                }
+                if (!clean_word.empty()) {
+                    auto it2 = word_to_idx.find(clean_word);
+                    if (it2 != word_to_idx.end()) {
+                        indices.push_back(it2->second);
+                    } else {
+                        std::cout << "  [Слово не найдено: '" << word << "'] ";
+                    }
+                }
             }
         }
         
@@ -339,6 +242,16 @@ public:
     
     std::string generate_text(const std::string& prompt, int max_words = 30) {
         std::vector<int> context = text_to_indices(prompt);
+        
+        std::cout << "  Контекст (" << context.size() << " слов): ";
+        for (int idx : context) {
+            if (idx >= 0 && static_cast<size_t>(idx) < vocabulary.size()) {
+                std::cout << vocabulary[idx] << "(" << idx << ") ";
+            } else {
+                std::cout << "?" << idx << "? ";
+            }
+        }
+        std::cout << std::endl;
         
         if (context.empty()) {
             return "Не могу понять ваш запрос. Попробуйте другие слова.";
@@ -359,26 +272,18 @@ public:
         
         // Берём последние CONTEXT_SIZE слов
         std::vector<int> current_context(
-            context.end() - std::min<int>(CONTEXT_SIZE, context.size()),
+            context.end() - std::min<int>(CONTEXT_SIZE, static_cast<int>(context.size())),
             context.end()
         );
         
         std::string result;
         
         for (int i = 0; i < max_words; ++i) {
-            int next_word_idx = -1;
+            int next_word_idx = model.predict_next(current_context);
             
-            if (use_pytorch_model) {
-                #ifdef USE_LIBTORCH
-                // БЫЛО: next_word_idx = pytorch_model->predict_next(current_context, vocab_size);
-                // СТАЛО: передаем только контекст
-                next_word_idx = pytorch_model->predict_next(current_context);
-                #endif
-            } else {
-                next_word_idx = original_model.predict_next(current_context);
-            }
-            
-            if (next_word_idx < 0 || next_word_idx >= (int)vocabulary.size()) {
+            if (next_word_idx < 0 || static_cast<size_t>(next_word_idx) >= vocabulary.size()) {
+                std::cout << "  Ошибка: idx=" << next_word_idx 
+                         << " при размере словаря=" << vocabulary.size() << std::endl;
                 if (i == 0) {
                     result = "[ошибка генерации]";
                 }
@@ -403,6 +308,11 @@ public:
                 next_word.find('?') != std::string::npos) {
                 break;
             }
+            
+            // Ограничиваем длину
+            if (result.size() > 200) {
+                break;
+            }
         }
         
         return result;
@@ -411,64 +321,37 @@ public:
     size_t get_vocabulary_size() const {
         return vocabulary.size();
     }
-    
-    std::string get_model_type() const {
-        return model_type;
-    }
 };
-
-// ==================== ФУНКЦИЯ ДЛЯ ПОИСКА ФАЙЛОВ МОДЕЛИ ====================
-std::pair<std::string, std::string> find_model_files() {
-    std::vector<std::pair<std::string, std::string>> candidates = {
-        {"models/model_cuda.pt", "models/vocab_cuda.txt"},
-        {"models/model.bin", "models/vocab.txt"},
-        {"model_cuda.pt", "vocab_cuda.txt"},
-        {"model.bin", "vocab.txt"},
-        {"../models/model_cuda.pt", "../models/vocab_cuda.txt"},
-        {"../models/model.bin", "../models/vocab.txt"}
-    };
-    
-    for (const auto& [model_path, vocab_path] : candidates) {
-        std::ifstream model_file(model_path);
-        std::ifstream vocab_file(vocab_path);
-        
-        if (model_file.good() && vocab_file.good()) {
-            model_file.close();
-            vocab_file.close();
-            std::cout << "Найдена модель: " << model_path << std::endl;
-            std::cout << "Найден словарь: " << vocab_path << std::endl;
-            return {model_path, vocab_path};
-        }
-    }
-    
-    throw std::runtime_error(
-        "Не найдены файлы модели и словаря. Разместите файлы в одной из папок:\n"
-        "  - models/model_cuda.pt + models/vocab_cuda.txt\n"
-        "  - models/model.bin + models/vocab.txt"
-    );
-}
 
 // ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 int main() {
     try {
         std::cout << "==================== AvoAI Chat ====================" << std::endl;
-        std::cout << "Поиск и загрузка модели..." << std::endl;
+        std::cout << "Универсальная версия (работает с .bin моделями)" << std::endl;
+        
+        // Проверяем наличие файлов модели
+        if (!fs::exists("models/model.bin") || !fs::exists("models/vocab.txt")) {
+            std::cerr << "Ошибка: файлы модели не найдены!" << std::endl;
+            std::cerr << "Сначала обучите модель:" << std::endl;
+            std::cerr << "  ./train_cuda  (для CUDA)" << std::endl;
+            std::cerr << "  ИЛИ" << std::endl;
+            std::cerr << "  ./train       (для CPU)" << std::endl;
+            return 1;
+        }
+        
+        std::cout << "Загрузка модели..." << std::endl;
         
         auto start = std::chrono::high_resolution_clock::now();
         
-        // Автоматически ищем файлы модели
-        auto [model_path, vocab_path] = find_model_files();
-        
-        // Создаем модель чата
-        ChatModel chat(model_path, vocab_path);
+        // Загружаем модель
+        ChatModel chat("models/model.bin", "models/vocab.txt");
         
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         
         std::cout << "Модель загружена за " << duration.count() << " мс" << std::endl;
-        std::cout << "Тип модели: " << chat.get_model_type() << std::endl;
         std::cout << "Размер словаря: " << chat.get_vocabulary_size() << " слов" << std::endl;
-        std::cout << "\nНачинайте общение (для выхода введите 'exit' или 'quit'):" << std::endl;
+        std::cout << "\nНачинайте общение (для выхода введите 'exit'):" << std::endl;
         std::cout << "====================================================\n" << std::endl;
         
         std::string input;
@@ -486,7 +369,7 @@ int main() {
             
             try {
                 auto gen_start = std::chrono::high_resolution_clock::now();
-                std::string response = chat.generate_text(input, 25);
+                std::string response = chat.generate_text(input, 20);
                 auto gen_end = std::chrono::high_resolution_clock::now();
                 auto gen_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                     gen_end - gen_start
@@ -503,8 +386,7 @@ int main() {
         std::cout << "\nДо новых встреч!" << std::endl;
         
     } catch (const std::exception& e) {
-        std::cerr << "Критическая ошибка: " << e.what() << std::endl;
-        std::cerr << "Убедитесь, что файлы модели и словаря существуют" << std::endl;
+        std::cerr << "Ошибка: " << e.what() << std::endl;
         return 1;
     }
     

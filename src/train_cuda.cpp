@@ -8,10 +8,11 @@
 #include <unordered_map>
 #include <chrono>
 #include <algorithm>
+#include <iomanip>
 
 namespace fs = std::filesystem;
 
-// 1. ОПРЕДЕЛЕНИЕ МОДЕЛИ
+// 1. ОПРЕДЕЛЕНИЕ МОДЕЛИ (совместимой с NeuralNetCPU)
 struct NeuralNetImpl : torch::nn::Module {
     torch::nn::Linear fc1{nullptr}, fc2{nullptr};
 
@@ -34,7 +35,7 @@ struct NeuralNetImpl : torch::nn::Module {
 };
 TORCH_MODULE(NeuralNet);
 
-// 2. ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ (АДАПТИРУЙТЕ ИХ ПОД СВОЙ КОД!)
+// 2. ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ
 std::vector<std::string> load_words(const std::string& data_dir) {
     std::vector<std::string> words;
     for (const auto& entry : fs::directory_iterator(data_dir)) {
@@ -67,7 +68,7 @@ std::vector<std::string> load_words(const std::string& data_dir) {
     return words;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, std::unordered_map<std::string, int64_t>>
+std::tuple<torch::Tensor, torch::Tensor, std::vector<std::string>>
 prepare_training_data(const std::vector<std::string>& words, int context_size, int64_t* vocab_size_out) {
     std::unordered_map<std::string, int64_t> word_to_idx;
     std::vector<std::string> idx_to_word;
@@ -110,12 +111,82 @@ prepare_training_data(const std::vector<std::string>& words, int context_size, i
     auto tgt_tensor = torch::from_blob(targets.data(), {static_cast<int64_t>(num_examples)},
                                        torch::dtype(torch::kInt64)).clone();
 
-    return {ctx_tensor, tgt_tensor, word_to_idx};
+    return {ctx_tensor, tgt_tensor, idx_to_word};
 }
 
-// 3. ГЛАВНАЯ ФУНКЦИЯ
+// 3. ФУНКЦИЯ ДЛЯ СОХРАНЕНИЯ В .BIN ФОРМАТЕ
+void save_model_bin(const std::string& filename, 
+                    const torch::Tensor& weights1,
+                    const torch::Tensor& weights2,
+                    const torch::Tensor& bias1,
+                    const torch::Tensor& bias2,
+                    size_t vocab_size,
+                    size_t hidden_size,
+                    float learning_rate = 0.01f) {
+    
+    std::ofstream file(filename, std::ios::binary);
+    
+    if (!file.is_open()) {
+        throw std::runtime_error("Не могу открыть файл для записи: " + filename);
+    }
+    
+    // Записываем размеры
+    file.write(reinterpret_cast<const char*>(&vocab_size), sizeof(vocab_size));
+    file.write(reinterpret_cast<const char*>(&hidden_size), sizeof(hidden_size));
+    file.write(reinterpret_cast<const char*>(&learning_rate), sizeof(learning_rate));
+    
+    // Получаем данные из тензоров
+    auto w1_cpu = weights1.cpu().contiguous();
+    auto w2_cpu = weights2.cpu().contiguous();
+    auto b1_cpu = bias1.cpu().contiguous();
+    auto b2_cpu = bias2.cpu().contiguous();
+    
+    // Проверяем размеры
+    if (w1_cpu.numel() != static_cast<int64_t>(hidden_size * vocab_size) ||
+        w2_cpu.numel() != static_cast<int64_t>(vocab_size * hidden_size) ||
+        b1_cpu.numel() != static_cast<int64_t>(hidden_size) ||
+        b2_cpu.numel() != static_cast<int64_t>(vocab_size)) {
+        throw std::runtime_error("Несовпадение размеров при сохранении модели");
+    }
+    
+    // Записываем weights1 (hidden_size x vocab_size)
+    file.write(reinterpret_cast<const char*>(w1_cpu.data_ptr<float>()),
+               w1_cpu.numel() * sizeof(float));
+    
+    // Записываем weights2 (vocab_size x hidden_size)
+    file.write(reinterpret_cast<const char*>(w2_cpu.data_ptr<float>()),
+               w2_cpu.numel() * sizeof(float));
+    
+    // Записываем bias1
+    file.write(reinterpret_cast<const char*>(b1_cpu.data_ptr<float>()),
+               b1_cpu.numel() * sizeof(float));
+    
+    // Записываем bias2
+    file.write(reinterpret_cast<const char*>(b2_cpu.data_ptr<float>()),
+               b2_cpu.numel() * sizeof(float));
+    
+    file.close();
+    std::cout << "Модель сохранена в бинарном формате: " << filename << std::endl;
+}
+
+// 4. ФУНКЦИЯ ДЛЯ СОХРАНЕНИЯ СЛОВАРЯ
+void save_vocabulary(const std::vector<std::string>& vocabulary, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Не могу открыть файл словаря: " + filename);
+    }
+    
+    for (const auto& word : vocabulary) {
+        file << word << "\n";
+    }
+    
+    file.close();
+    std::cout << "Словарь сохранен: " << filename << " (" << vocabulary.size() << " слов)" << std::endl;
+}
+
+// 5. ГЛАВНАЯ ФУНКЦИЯ
 int main() {
-    std::cout << "\n=== AvoAI CUDA Trainer ===\n" << std::endl;
+    std::cout << "\n=== AvoAI CUDA Trainer (бинарный формат) ===\n" << std::endl;
 
     // A. ВЫБОР УСТРОЙСТВА (GPU/CPU)
     torch::Device device(torch::kCPU);
@@ -143,8 +214,8 @@ int main() {
 
     int64_t vocab_size;
     torch::Tensor all_contexts, all_targets;
-    std::unordered_map<std::string, int64_t> vocab;
-    std::tie(all_contexts, all_targets, vocab) = prepare_training_data(words, CONTEXT_SIZE, &vocab_size);
+    std::vector<std::string> vocabulary;
+    std::tie(all_contexts, all_targets, vocabulary) = prepare_training_data(words, CONTEXT_SIZE, &vocab_size);
 
     // Перенос данных на GPU (если доступно)
     all_contexts = all_contexts.to(device);
@@ -219,31 +290,43 @@ int main() {
     auto total_time = std::chrono::duration<double>(total_end - total_start).count();
     std::cout << "\n    Общее время обучения: " << std::setprecision(1) << total_time << " секунд." << std::endl;
 
-    // F. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
+    // F. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ В БИНАРНОМ ФОРМАТЕ
     std::cout << "\n[4/4] Сохранение модели и словаря..." << std::endl;
-    if (!fs::exists("../models")) {
-        fs::create_directory("../models");
+    if (!fs::exists("models")) {
+        fs::create_directory("models");
     }
 
-    // Сохраняем модель
-    torch::save(model, "../models/model_cuda.pt");
+    // Извлекаем веса из модели
+    model->eval();
+    
+    // Получаем параметры модели
+    auto params = model->named_parameters();
+    
+    // weights1: fc1.weight (hidden_size x vocab_size)
+    auto fc1_weight = params["fc1.weight"].clone().cpu();
+    // bias1: fc1.bias (hidden_size)
+    auto fc1_bias = params["fc1.bias"].clone().cpu();
+    // weights2: fc2.weight (vocab_size x hidden_size)
+    auto fc2_weight = params["fc2.weight"].clone().cpu();
+    // bias2: fc2.bias (vocab_size)
+    auto fc2_bias = params["fc2.bias"].clone().cpu();
+    
+    // Сохраняем модель в .bin формате
+    save_model_bin("models/model.bin", 
+                   fc1_weight,   // weights1
+                   fc2_weight,   // weights2 (уже правильный размер)
+                   fc1_bias,     // bias1
+                   fc2_bias,     // bias2
+                   static_cast<size_t>(vocab_size), 
+                   static_cast<size_t>(HIDDEN_SIZE),
+                   0.01f);
+    
     // Сохраняем словарь
-    std::ofstream vocab_file("../models/vocab_cuda.txt");
-    for (const auto& [word, idx] : vocab) {
-        vocab_file << word << "\t" << idx << "\n";
-    }
-    vocab_file.close();
-
-    // Сохраняем мета-информацию
-    std::ofstream meta("../models/meta_cuda.txt");
-    meta << "vocab_size " << vocab_size << "\n";
-    meta << "hidden_size " << HIDDEN_SIZE << "\n";
-    meta << "context_size " << CONTEXT_SIZE << "\n";
-    meta.close();
+    save_vocabulary(vocabulary, "models/vocab.txt");
 
     std::cout << "\n✅ Обучение завершено успешно!" << std::endl;
-    std::cout << "   Модель:     ../models/model_cuda.pt" << std::endl;
-    std::cout << "   Словарь:    ../models/vocab_cuda.txt" << std::endl;
-    std::cout << "   Метаданные: ../models/meta_cuda.txt" << std::endl;
+    std::cout << "   Модель:     models/model.bin" << std::endl;
+    std::cout << "   Словарь:    models/vocab.txt" << std::endl;
+    std::cout << "   Формат:     бинарный (.bin) - совместим с обычной версией" << std::endl;
     return 0;
 }
